@@ -1,0 +1,414 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  test-flux — vérifie les flux réseau sortants de ce serveur, par application
+# =============================================================================
+#  Usage :  ./test-flux [options]
+#
+#    -a NOM    ne tester que l'application NOM (option répétable)
+#    -t SEC    timeout par flux, en secondes (défaut : voir TIMEOUT plus bas)
+#    -m MODE   méthode de test : auto (défaut), nc, bash
+#    -l        lister les applications et flux définis, sans rien tester
+#    -q        n'afficher que le récapitulatif
+#    -n        pas de couleurs (automatique si la sortie n'est pas un terminal)
+#    -h        aide
+#
+#  Code retour : 0 si tous les flux testés sont ouverts, 1 sinon, 2 si erreur.
+#
+#  Pour ajouter / modifier des flux : seule la section CONFIGURATION est à
+#  éditer. Le reste du fichier n'a pas besoin d'être touché.
+# =============================================================================
+
+# ------------------------------ CONFIGURATION --------------------------------
+#  Une application = une ligne [nom-application], suivie de ses flux,
+#  un flux par ligne :
+#
+#      hote:port        description libre (optionnelle)
+#
+#  IPv6 entre crochets : [2001:db8::1]:443
+#  Lignes vides et lignes commençant par # ignorées.
+
+FLUX='
+[exemple-web]
+www.google.com:443          HTTPS sortant
+1.1.1.1:53                  DNS Cloudflare (TCP)
+
+[exemple-echecs]
+localhost:1                 Port fermé, attendu REFUSÉ
+10.255.255.1:80             IP non routée, attendu TIMEOUT
+nexiste-pas.invalid:443     Nom inconnu, attendu DNS
+'
+
+TIMEOUT=3
+
+# ------------------------- FIN DE LA CONFIGURATION ---------------------------
+#  Rien à modifier en dessous de cette ligne.
+# -----------------------------------------------------------------------------
+
+MODE=auto
+QUIET=0
+LISTE=0
+COULEUR=1
+FILTRES=()
+
+usage() {
+    cat <<'EOF'
+Usage : test-flux [options]
+
+  -a NOM    ne tester que l'application NOM (option répétable)
+  -t SEC    timeout par flux, en secondes
+  -m MODE   méthode de test : auto (défaut), nc, bash
+  -l        lister les applications et flux définis, sans rien tester
+  -q        n'afficher que le récapitulatif
+  -n        pas de couleurs
+  -h        cette aide
+
+Statuts :
+  OUVERT   la connexion TCP aboutit
+  REFUSÉ   la machine répond mais refuse (port fermé, ou firewall en REJECT)
+  TIMEOUT  aucune réponse (firewall en DROP, route absente, machine éteinte)
+  DNS      le nom ne se résout pas depuis ce serveur
+  ERREUR   autre échec (no route to host, network unreachable...)
+
+Code retour : 0 si tous les flux sont ouverts, 1 sinon, 2 si erreur.
+EOF
+}
+
+erreur() { printf 'test-flux : %s\n' "$*" >&2; exit 2; }
+
+for arg in "$@"; do
+    case $arg in --help|-help|help) usage; exit 0 ;; esac
+done
+
+while getopts ":a:t:m:lqnh" opt; do
+    case $opt in
+        a) FILTRES+=("$OPTARG") ;;
+        t) TIMEOUT=$OPTARG ;;
+        m) MODE=$OPTARG ;;
+        l) LISTE=1 ;;
+        q) QUIET=1 ;;
+        n) COULEUR=0 ;;
+        h) usage; exit 0 ;;
+        :) erreur "l'option -$OPTARG attend une valeur (voir -h)" ;;
+        *) erreur "option inconnue -$OPTARG (voir -h)" ;;
+    esac
+done
+
+[[ $TIMEOUT =~ ^[0-9]+$ ]] && [ "$TIMEOUT" -gt 0 ] || erreur "timeout invalide : $TIMEOUT"
+case $MODE in auto|nc|bash) ;; *) erreur "méthode inconnue : $MODE (auto, nc ou bash)" ;; esac
+
+# --- Affichage ---------------------------------------------------------------
+
+TTY=0
+[ -t 1 ] && TTY=1
+if [ $TTY -eq 1 ] && [ $COULEUR -eq 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_VERT=$'\033[32m'; C_ROUGE=$'\033[31m'; C_JAUNE=$'\033[33m'
+    C_BLEU=$'\033[36m'; C_GRAS=$'\033[1m'; C_DIM=$'\033[2m'; C_RAZ=$'\033[0m'
+else
+    C_VERT=; C_ROUGE=; C_JAUNE=; C_BLEU=; C_GRAS=; C_DIM=; C_RAZ=
+fi
+
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*)
+        S_OK='✔'; S_KO='✘'; B_H='─'; B_D='═'; B_HG='┌'; B_V='│'; B_BG='└' ;;
+    *)
+        S_OK='+'; S_KO='x'; B_H='-'; B_D='='; B_HG='+'; B_V='|'; B_BG='+' ;;
+esac
+LARGEUR=78
+
+# Répète une chaîne N fois.
+repete() { local s; printf -v s '%*s' "$2" ''; printf '%s' "${s// /$1}"; }
+
+# Complète une chaîne à droite jusqu'à N caractères (compte en caractères,
+# pas en octets : les accents ne décalent pas les colonnes).
+pad() { local s=$1; printf '%s' "$s"; [ ${#s} -lt "$2" ] && printf '%*s' $(($2 - ${#s})) ''; }
+padg() { local s=$1; [ ${#s} -lt "$2" ] && printf '%*s' $(($2 - ${#s})) ''; printf '%s' "$s"; }
+
+trim() {
+    local s=$1
+    s="${s#"${s%%[![:space:]]*}"}"
+    printf '%s' "${s%"${s##*[![:space:]]}"}"
+}
+
+# --- Lecture de la configuration ---------------------------------------------
+
+APPS=(); F_APP=(); F_HOTE=(); F_PORT=(); F_CIBLE=(); F_DESC=()
+LARG_CIBLE=12; LARG_DESC=0; LARG_APP=11
+re_app='^\[([^]]+)\]$'
+app=""; num=0
+
+app_connue() { local a; for a in "${APPS[@]}"; do [ "$a" = "$1" ] && return 0; done; return 1; }
+
+while IFS= read -r ligne || [ -n "$ligne" ]; do
+    num=$((num + 1))
+    ligne=$(trim "${ligne%$'\r'}")
+    case $ligne in ''|'#'*) continue ;; esac
+
+    if [[ $ligne =~ $re_app ]]; then
+        app=$(trim "${BASH_REMATCH[1]}")
+        app_connue "$app" || APPS+=("$app")
+        [ ${#app} -gt $LARG_APP ] && LARG_APP=${#app}
+        continue
+    fi
+
+    cible=${ligne%%[[:space:]]*}
+    desc=$(trim "${ligne#"$cible"}")
+    if [[ $cible == \[*\]:* ]]; then
+        hote=${cible#\[}; hote=${hote%%\]*}; port=${cible##*\]:}
+    elif [[ $cible == *:* ]]; then
+        hote=${cible%:*}; port=${cible##*:}
+    else
+        printf '%sAttention : ligne %d ignorée (format attendu hote:port) : %s%s\n' "$C_JAUNE" "$num" "$ligne" "$C_RAZ" >&2
+        continue
+    fi
+    if ! [[ $port =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ] || [ -z "$hote" ]; then
+        printf '%sAttention : ligne %d ignorée (hôte ou port invalide) : %s%s\n' "$C_JAUNE" "$num" "$ligne" "$C_RAZ" >&2
+        continue
+    fi
+    if [ -z "$app" ]; then
+        app="(sans application)"
+        app_connue "$app" || APPS+=("$app")
+    fi
+
+    F_APP+=("$app"); F_HOTE+=("$hote"); F_PORT+=("$port"); F_CIBLE+=("$cible"); F_DESC+=("$desc")
+    [ ${#cible} -gt $LARG_CIBLE ] && LARG_CIBLE=${#cible}
+    [ ${#desc} -gt $LARG_DESC ] && LARG_DESC=${#desc}
+done <<< "$FLUX"
+
+[ $LARG_DESC -gt 34 ] && LARG_DESC=34
+[ ${#F_APP[@]} -eq 0 ] && erreur "aucun flux défini dans la section CONFIGURATION"
+
+# Filtre -a : ne garder que les applications demandées, dans l'ordre du fichier.
+if [ ${#FILTRES[@]} -gt 0 ]; then
+    for f in "${FILTRES[@]}"; do
+        app_connue "$f" || erreur "application inconnue : $f (voir -l)"
+    done
+    garde=()
+    for a in "${APPS[@]}"; do
+        for f in "${FILTRES[@]}"; do [ "$a" = "$f" ] && garde+=("$a") && break; done
+    done
+    APPS=("${garde[@]}")
+fi
+
+flux_de() {  # indices des flux d'une application
+    local i
+    for i in "${!F_APP[@]}"; do [ "${F_APP[$i]}" = "$1" ] && printf '%s ' "$i"; done
+}
+
+if [ $LISTE -eq 1 ]; then
+    for a in "${APPS[@]}"; do
+        printf '%s%s[%s]%s\n' "$C_GRAS" "$C_BLEU" "$a" "$C_RAZ"
+        for i in $(flux_de "$a"); do
+            printf '  %s  %s%s%s\n' "$(pad "${F_CIBLE[$i]}" $LARG_CIBLE)" "$C_DIM" "${F_DESC[$i]}" "$C_RAZ"
+        done
+    done
+    exit 0
+fi
+
+# --- Méthode de test ---------------------------------------------------------
+
+A_TIMEOUT=0; command -v timeout >/dev/null 2>&1 && A_TIMEOUT=1
+A_GETENT=0;  command -v getent  >/dev/null 2>&1 && A_GETENT=1
+A_NC=0
+if command -v nc >/dev/null 2>&1 && nc -h </dev/null 2>&1 | grep -q -- '-z'; then A_NC=1; fi
+
+case $MODE in
+    auto)
+        if [ $A_NC -eq 1 ]; then METHODE=nc
+        elif [ $A_TIMEOUT -eq 1 ]; then METHODE=bash
+        else erreur "ni 'nc' (avec -z) ni 'timeout' disponibles sur ce serveur"
+        fi ;;
+    nc)   [ $A_NC -eq 1 ] || erreur "'nc' absent ou sans option -z"; METHODE=nc ;;
+    bash) [ $A_TIMEOUT -eq 1 ] || erreur "la méthode bash nécessite la commande 'timeout'"; METHODE=bash ;;
+esac
+
+# Horloge en millisecondes : EPOCHREALTIME (bash 5), sinon date GNU, sinon secondes.
+if [ -n "${EPOCHREALTIME:-}" ]; then
+    maintenant_ms() { local t=${EPOCHREALTIME/[.,]/}; printf '%s' $((10#$t / 1000)); }
+elif [[ $(date +%3N 2>/dev/null) =~ ^[0-9]+$ ]]; then
+    maintenant_ms() { date +%s%3N; }
+else
+    maintenant_ms() { printf '%s' $(($(date +%s) * 1000)); }
+fi
+
+est_ip() { [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || $1 == *:* ]]; }
+
+# Teste un flux. Renseigne R_STATUT, R_MS et R_DETAIL.
+tester() {
+    local hote=$1 port=$2 sortie rc t0 s
+    R_DETAIL=""; R_MS=""
+
+    if [ $A_GETENT -eq 1 ] && ! est_ip "$hote" && ! getent hosts "$hote" >/dev/null 2>&1; then
+        R_STATUT=DNS; R_DETAIL="nom non résolu"; return
+    fi
+
+    t0=$(maintenant_ms)
+    if [ $METHODE = nc ]; then
+        if [ $A_TIMEOUT -eq 1 ]; then
+            sortie=$(LC_ALL=C timeout $((TIMEOUT + 2)) nc -zv -w "$TIMEOUT" "$hote" "$port" </dev/null 2>&1); rc=$?
+        else
+            sortie=$(LC_ALL=C nc -zv -w "$TIMEOUT" "$hote" "$port" </dev/null 2>&1); rc=$?
+        fi
+    else
+        sortie=$(LC_ALL=C timeout "$TIMEOUT" "${BASH:-bash}" -c 'exec 3<>"/dev/tcp/$0/$1"' "$hote" "$port" 2>&1); rc=$?
+    fi
+    R_MS=$(( $(maintenant_ms) - t0 ))
+
+    s=$(printf '%s' "$sortie" | tr '[:upper:]' '[:lower:]')
+    if [ $rc -eq 124 ]; then
+        R_STATUT=TIMEOUT
+    elif [[ $s == *refused* ]]; then
+        R_STATUT=REFUSE
+    elif [[ $s == *"timed out"* || $s == *timeout* ]]; then
+        R_STATUT=TIMEOUT
+    elif [ $rc -eq 0 ]; then
+        R_STATUT=OUVERT
+    elif [[ $s == *resolve* || $s == *"not known"* || $s == *getaddrinfo* || $s == *"no address"* ]]; then
+        R_STATUT=DNS; R_DETAIL="nom non résolu"
+    else
+        R_STATUT=ERREUR
+        # dernière ligne non vide de la sortie, sans le préfixe de l'outil
+        R_DETAIL=$(printf '%s\n' "$sortie" | grep -v '^[[:space:]]*$' | tail -n 1)
+        R_DETAIL=${R_DETAIL##*: }
+        [ -z "$R_DETAIL" ] && R_DETAIL="code retour $rc"
+    fi
+}
+
+libelle() {  # statut -> texte coloré et symbole, largeur fixe
+    case $1 in
+        OUVERT)  printf '%s%s %s%s' "$C_VERT"  "$S_OK" "$(pad OUVERT 7)"  "$C_RAZ" ;;
+        REFUSE)  printf '%s%s %s%s' "$C_ROUGE" "$S_KO" "$(pad REFUSÉ 7)"  "$C_RAZ" ;;
+        TIMEOUT) printf '%s%s %s%s' "$C_JAUNE" "$S_KO" "$(pad TIMEOUT 7)" "$C_RAZ" ;;
+        DNS)     printf '%s%s %s%s' "$C_ROUGE" "$S_KO" "$(pad DNS 7)"     "$C_RAZ" ;;
+        *)       printf '%s%s %s%s' "$C_ROUGE" "$S_KO" "$(pad ERREUR 7)"  "$C_RAZ" ;;
+    esac
+}
+
+verdict() {  # ouverts total -> verdict coloré
+    if [ "$1" -eq "$2" ]; then printf '%s%s%s' "$C_VERT$C_GRAS" "$(pad '100% OK' 9)" "$C_RAZ"
+    elif [ "$1" -eq 0 ]; then printf '%s%s%s' "$C_ROUGE$C_GRAS" "$(pad 'KO' 9)" "$C_RAZ"
+    else printf '%s%s%s' "$C_JAUNE$C_GRAS" "$(pad 'PARTIEL' 9)" "$C_RAZ"
+    fi
+}
+
+# --- Exécution ---------------------------------------------------------------
+
+total_flux=0
+for a in "${APPS[@]}"; do set -- $(flux_de "$a"); total_flux=$((total_flux + $#)); done
+
+HOTE_LOCAL=$(hostname 2>/dev/null || uname -n)
+debut=$(date +%s)
+
+printf '%s%s%s\n' "$C_BLEU" "$(repete "$B_D" $LARGEUR)" "$C_RAZ"
+printf '  %sTEST-FLUX%s  ·  %s%s%s  ·  %s\n' "$C_GRAS" "$C_RAZ" "$C_GRAS" "$HOTE_LOCAL" "$C_RAZ" "$(date '+%Y-%m-%d %H:%M:%S')"
+printf '  %sméthode : %s · timeout : %s s · %d application(s) · %d flux%s\n' \
+    "$C_DIM" "$METHODE" "$TIMEOUT" ${#APPS[@]} $total_flux "$C_RAZ"
+printf '%s%s%s\n' "$C_BLEU" "$(repete "$B_D" $LARGEUR)" "$C_RAZ"
+
+declare -a RES_STATUT RES_MS RES_DETAIL
+APP_OK=(); APP_REF=(); APP_TO=(); APP_ERR=(); APP_TOT=()
+n=0
+
+for ia in "${!APPS[@]}"; do
+    a=${APPS[$ia]}
+    indices=$(flux_de "$a")
+    set -- $indices
+    nb=$#
+    ok=0; ref=0; to=0; err=0
+
+    if [ $QUIET -eq 0 ]; then
+        printf '\n%s%s%s %s%s%s %s(%d flux)%s\n' "$C_BLEU" "$B_HG" "$B_H" "$C_GRAS" "$a" "$C_RAZ" "$C_DIM" $nb "$C_RAZ"
+    fi
+
+    for i in $indices; do
+        n=$((n + 1))
+        if [ $TTY -eq 1 ]; then
+            if [ $QUIET -eq 0 ]; then
+                printf '%s%s%s  %s… test de %s%s' "$C_BLEU" "$B_V" "$C_RAZ" "$C_DIM" "${F_CIBLE[$i]}" "$C_RAZ"
+            else
+                printf '%s… flux %d/%d : %s%s' "$C_DIM" $n $total_flux "${F_CIBLE[$i]}" "$C_RAZ"
+            fi
+        fi
+
+        tester "${F_HOTE[$i]}" "${F_PORT[$i]}"
+        RES_STATUT[$i]=$R_STATUT; RES_MS[$i]=$R_MS; RES_DETAIL[$i]=$R_DETAIL
+
+        case $R_STATUT in
+            OUVERT) ok=$((ok + 1)) ;;
+            REFUSE) ref=$((ref + 1)) ;;
+            TIMEOUT) to=$((to + 1)) ;;
+            *) err=$((err + 1)) ;;
+        esac
+
+        [ $TTY -eq 1 ] && printf '\r\033[K'
+        [ $QUIET -eq 1 ] && continue
+
+        duree=""; [ -n "$R_MS" ] && duree="$R_MS ms"
+        printf '%s%s%s  %s  %s  %s%s%s  %s%s%s' \
+            "$C_BLEU" "$B_V" "$C_RAZ" \
+            "$(libelle "$R_STATUT")" \
+            "$(pad "${F_CIBLE[$i]}" $LARG_CIBLE)" \
+            "$C_DIM" "$(pad "${F_DESC[$i]:0:$LARG_DESC}" $LARG_DESC)" "$C_RAZ" \
+            "$C_DIM" "$(padg "$duree" 8)" "$C_RAZ"
+        [ -n "$R_DETAIL" ] && printf '  %s(%s)%s' "$C_ROUGE" "$R_DETAIL" "$C_RAZ"
+        printf '\n'
+    done
+
+    APP_OK[$ia]=$ok; APP_REF[$ia]=$ref; APP_TO[$ia]=$to; APP_ERR[$ia]=$err; APP_TOT[$ia]=$nb
+
+    if [ $QUIET -eq 0 ]; then
+        printf '%s%s%s%s %s %s%d/%d ouverts%s\n' "$C_BLEU" "$B_BG" "$B_H" "$C_RAZ" \
+            "$(verdict $ok $nb)" "$C_DIM" $ok $nb "$C_RAZ"
+    fi
+done
+
+# --- Récapitulatif -----------------------------------------------------------
+
+t_ok=0; t_ref=0; t_to=0; t_err=0; a_ok=0; a_part=0; a_ko=0
+
+printf '\n%s%s%s\n' "$C_BLEU" "$(repete "$B_D" $LARGEUR)" "$C_RAZ"
+printf '  %sRÉCAPITULATIF%s\n' "$C_GRAS" "$C_RAZ"
+printf '%s%s%s\n' "$C_BLEU" "$(repete "$B_D" $LARGEUR)" "$C_RAZ"
+printf '  %s%s  %s %s %s %s %s  %s%s\n' "$C_GRAS" \
+    "$(pad APPLICATION $LARG_APP)" "$(padg FLUX 5)" "$(padg OUVERTS 8)" \
+    "$(padg REFUSÉS 8)" "$(padg TIMEOUTS 9)" "$(padg ERREURS 8)" VERDICT "$C_RAZ"
+printf '  %s%s%s\n' "$C_DIM" "$(repete "$B_H" $((LARG_APP + 2 + 5 + 9 + 9 + 10 + 9 + 2 + 9)))" "$C_RAZ"
+
+for ia in "${!APPS[@]}"; do
+    ok=${APP_OK[$ia]}; nb=${APP_TOT[$ia]}
+    t_ok=$((t_ok + ok)); t_ref=$((t_ref + APP_REF[ia])); t_to=$((t_to + APP_TO[ia])); t_err=$((t_err + APP_ERR[ia]))
+    if [ $ok -eq $nb ]; then a_ok=$((a_ok + 1)); elif [ $ok -eq 0 ]; then a_ko=$((a_ko + 1)); else a_part=$((a_part + 1)); fi
+
+    printf '  %s  %s %s%s%s %s %s %s  %s\n' \
+        "$(pad "${APPS[$ia]}" $LARG_APP)" "$(padg $nb 5)" \
+        "$C_VERT" "$(padg $ok 8)" "$C_RAZ" \
+        "$( [ "${APP_REF[$ia]}" -gt 0 ] && printf '%s' "$C_ROUGE")$(padg "${APP_REF[$ia]}" 8)$C_RAZ" \
+        "$( [ "${APP_TO[$ia]}" -gt 0 ] && printf '%s' "$C_JAUNE")$(padg "${APP_TO[$ia]}" 9)$C_RAZ" \
+        "$( [ "${APP_ERR[$ia]}" -gt 0 ] && printf '%s' "$C_ROUGE")$(padg "${APP_ERR[$ia]}" 8)$C_RAZ" \
+        "$(verdict $ok $nb)"
+done
+
+printf '  %s%s%s\n' "$C_DIM" "$(repete "$B_H" $((LARG_APP + 2 + 5 + 9 + 9 + 10 + 9 + 2 + 9)))" "$C_RAZ"
+printf '  %s%s  %s %s %s %s %s%s\n' "$C_GRAS" \
+    "$(pad TOTAL $LARG_APP)" "$(padg $total_flux 5)" "$(padg $t_ok 8)" \
+    "$(padg $t_ref 8)" "$(padg $t_to 9)" "$(padg $t_err 8)" "$C_RAZ"
+
+# Détail des échecs, pour copier-coller dans une demande d'ouverture de flux.
+if [ $t_ok -lt $total_flux ]; then
+    printf '\n  %sFlux en échec :%s\n' "$C_GRAS" "$C_RAZ"
+    for ia in "${!APPS[@]}"; do
+        for i in $(flux_de "${APPS[$ia]}"); do
+            [ "${RES_STATUT[$i]}" = OUVERT ] && continue
+            printf '    %s  %s  %s  %s%s%s\n' "$(libelle "${RES_STATUT[$i]}")" \
+                "$(pad "${APPS[$ia]}" $LARG_APP)" "$(pad "${F_CIBLE[$i]}" $LARG_CIBLE)" \
+                "$C_DIM" "${F_DESC[$i]}" "$C_RAZ"
+        done
+    done
+fi
+
+duree_tot=$(( $(date +%s) - debut ))
+printf '\n  %d/%d flux ouverts  ·  ' $t_ok $total_flux
+printf '%s%d app. 100%% OK%s  ·  %s%d partielle(s)%s  ·  %s%d KO%s' \
+    "$C_VERT" $a_ok "$C_RAZ" "$C_JAUNE" $a_part "$C_RAZ" "$C_ROUGE" $a_ko "$C_RAZ"
+printf '  %s(%d s)%s\n\n' "$C_DIM" $duree_tot "$C_RAZ"
+
+[ $t_ok -eq $total_flux ] && exit 0 || exit 1
